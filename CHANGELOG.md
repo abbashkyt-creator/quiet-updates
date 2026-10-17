@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.1 (2026-10-17)
+
+Bugs found in review of 0.2.0. Each one has a test that fails on 0.2.0 and passes now.
+
+- **Fixed: evicting skipped values brought back the stretched interval.**
+  - The stored clock was kept with the skipped values. Evicting them left the object's own clock, which a skip had
+    just overwritten in memory. With `expire_on_commit=False` and more rows than `max_remembered`, rows were never
+    written again.
+  - The stored clock is now kept per object, in a weak dictionary that eviction never touches.
+  - Test: `test_evicted_values_cannot_stretch_the_interval`.
+- **Fixed (data loss): a write that was not committed lost the skipped values.**
+  - A write took them out of memory at flush time. If its transaction rolled back, or the session closed without a
+    commit, they were gone.
+  - Memory changes are now journalled per transaction. A commit keeps them; a rollback or close undoes them.
+  - Test: `test_a_write_that_is_not_committed_gives_the_skipped_values_back`, for rollback and for close.
+- **Fixed: values skipped in a rolled-back transaction were still written later.** Test:
+  `test_skips_in_a_rolled_back_transaction_are_forgotten`.
+- **Fixed: a clock read inside a rolled-back transaction was still trusted.** A skip right after a write
+  remembered the clock that write had stored, and kept using it after the rollback. Test:
+  `test_a_clock_read_inside_a_rolled_back_transaction_is_not_trusted`.
+- **Fixed: a rolled-back SAVEPOINT lost what its write took.** Now it gives it back and keeps the skips of the
+  transaction around it. Test: `test_a_rolled_back_savepoint_gives_back_what_its_write_took`.
+- **Fixed: the stored clock was read from the database on every flush of an expired object,** even when it was
+  already known. A default argument was evaluated eagerly. Test: `test_the_stored_clock_is_read_once_per_object`.
+
 ## 0.2.0 (2026-10-17)
 
 Bugs found in review of 0.1.0. Each one has a test that fails on 0.1.0 and passes now.

@@ -12,11 +12,17 @@ remembered (``quiet.value(obj, column)`` returns the newest one) and are written
 with the row's next UPDATE: a real data change, or the first bookkeeping change
 after the interval.
 
+Memory follows the transaction. A write takes the remembered values with it,
+and they come back if that transaction rolls back or is closed without a commit.
+Values skipped inside a transaction that rolls back are forgotten again. A
+rolled-back SAVEPOINT only gives back what its writes took.
+
 Only ORM flushes are seen. Core ``update()`` statements bypass the hook.
 """
 from __future__ import annotations
 
 import threading
+import weakref
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -27,9 +33,11 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified, set_committed_value
 
 __all__ = ["QuietUpdates", "QuietStats"]
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
-_DB_CLOCK = object()  # memory slot for the clock value the database really holds
+_ABSENT = object()  # "this column had no remembered value"
+_JOURNAL = "quiet_updates.journal"  # session.info: memory changes not yet committed
+_CLOCKS = "quiet_updates.clocks"  # session.info: stored clocks recorded since the last commit
 
 
 def _utc_now() -> datetime:
@@ -63,8 +71,9 @@ class QuietUpdates:
     """Register models, then ``install`` on a Session class or sessionmaker.
 
     ``max_remembered`` bounds the memory of skipped values. When it is full,
-    the oldest row is forgotten: its database copy simply stays older until
-    that row's next real write.
+    the oldest row's skipped values are forgotten and never reach the
+    database. The interval is still kept: the row's next bookkeeping change
+    is judged against the clock the database holds, as always.
     """
 
     now: Callable[[], datetime] = _utc_now
@@ -72,6 +81,10 @@ class QuietUpdates:
     stats: QuietStats = field(default_factory=QuietStats)
     _rules: dict[type, _Rule] = field(default_factory=dict)
     _memory: "OrderedDict[tuple, dict]" = field(default_factory=OrderedDict)
+    # The clock the database held when an object's first skip overwrote it in
+    # memory, per object. Separate from _memory, so evicting skipped values can
+    # never make a row look fresher than it is.
+    _clocks: "weakref.WeakKeyDictionary" = field(default_factory=weakref.WeakKeyDictionary)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def watch(
@@ -99,11 +112,13 @@ class QuietUpdates:
 
     def install(self, target: type[Session] | object = Session) -> "QuietUpdates":
         """Listen on a Session class, a sessionmaker, or a single Session."""
-        event.listen(target, "before_flush", self._before_flush)
+        for name, listener in self._listeners():
+            event.listen(target, name, listener)
         return self
 
     def uninstall(self, target: type[Session] | object = Session) -> None:
-        event.remove(target, "before_flush", self._before_flush)
+        for name, listener in self._listeners():
+            event.remove(target, name, listener)
 
     def value(self, obj: object, column: str):
         """The newest value of ``column``: a skipped one if any, else the object's."""
@@ -114,6 +129,14 @@ class QuietUpdates:
         return getattr(obj, column)
 
     # -- internals ---------------------------------------------------------
+
+    def _listeners(self):
+        return (
+            ("before_flush", self._before_flush),
+            ("after_commit", self._after_commit),
+            ("after_soft_rollback", self._after_soft_rollback),
+            ("after_transaction_end", self._after_transaction_end),
+        )
 
     @staticmethod
     def _key(obj: object) -> tuple:
@@ -132,40 +155,118 @@ class QuietUpdates:
             if rule is None or not session.is_modified(obj, include_collections=False):
                 continue
             state = inspect(obj)
-            changed = {a.key: a.history for a in state.attrs if a.history.has_changes()}
+            changed = {
+                a.key: (a.history.added[0] if a.history.added else None)
+                for a in state.attrs
+                if a.history.has_changes()
+            }
             if not changed:
                 continue
-            key = self._key(obj)
-            with self._lock:
-                remembered = self._memory.get(key, {})
-                db_clock = remembered.get(_DB_CLOCK, self._stored(state, rule.clock))
-                quiet = set(changed) <= rule.columns and self._fresh(db_clock, rule)
-                if not quiet:
-                    self._memory.pop(key, None)
-            if not quiet:
-                # Real write: carry every skipped value that was not changed again.
-                for column, value in remembered.items():
-                    if column is not _DB_CLOCK and column not in changed:
-                        setattr(obj, column, value)
-                        flag_modified(obj, column)
-                self.stats.written += 1
-                continue
-            with self._lock:
-                entry = self._memory.pop(key, {})
-                entry.setdefault(_DB_CLOCK, db_clock)
-                for column, history in changed.items():
-                    entry[column] = history.added[0] if history.added else None
-                self._memory[key] = entry  # most recently used goes last
-                while len(self._memory) > self.max_remembered:
-                    self._memory.popitem(last=False)
-            for column, history in changed.items():
-                # Accept the new value on the object without scheduling a write.
-                set_committed_value(obj, column, history.added[0] if history.added else None)
-            self.stats.skipped += 1
+            if set(changed) <= rule.columns:
+                db_clock = self._db_clock(state, rule.clock)
+                if self._fresh(db_clock, rule):
+                    self._skip(session, state, rule.clock, changed, db_clock)
+                    continue
+            self._write(session, state, changed)
 
-    @staticmethod
-    def _stored(state, clock: str):
+    def _skip(self, session: Session, state, clock: str, changed: dict, db_clock) -> None:
+        key = self._key(state.obj())
+        with self._lock:
+            if state not in self._clocks:
+                self._clocks[state] = db_clock
+                session.info.setdefault(_CLOCKS, []).append((state, clock))
+            entry = self._memory.pop(key, {})
+            journal = session.info.setdefault(_JOURNAL, {}).setdefault(key, {})
+            for column, value in changed.items():
+                line = journal.setdefault(column, [entry.get(column, _ABSENT), None, None])
+                line[1] = value  # [before this transaction, now in memory, taken by a write]
+                entry[column] = value
+            self._memory[key] = entry  # most recently used goes last
+            self._trim()
+        for column, value in changed.items():
+            # Accept the new value on the object without scheduling a write.
+            set_committed_value(state.obj(), column, value)
+        self.stats.skipped += 1
+
+    def _write(self, session: Session, state, changed: dict) -> None:
+        key = self._key(state.obj())
+        with self._lock:
+            self._clocks.pop(state, None)  # after this write the object holds the stored clock
+            remembered = self._memory.pop(key, {})
+            if remembered:
+                journal = session.info.setdefault(_JOURNAL, {}).setdefault(key, {})
+                for column, value in remembered.items():
+                    line = journal.setdefault(column, [value, None, None])
+                    line[1], line[2] = _ABSENT, value
+        # Real write: carry every skipped value that was not changed again.
+        for column, value in remembered.items():
+            if column not in changed:
+                setattr(state.obj(), column, value)
+                flag_modified(state.obj(), column)
+        self.stats.written += 1
+
+    def _after_commit(self, session: Session) -> None:
+        session.info.pop(_JOURNAL, None)
+        session.info.pop(_CLOCKS, None)
+
+    def _after_soft_rollback(self, session: Session, previous_transaction) -> None:
+        # A SAVEPOINT (or a flush failing inside one) leaves the outer
+        # transaction alive: give back only what writes took, and keep the
+        # journal, since the outer transaction may still roll back as a whole.
+        partial = previous_transaction.nested or session.in_nested_transaction()
+        self._undo(session, writes_only=partial)
+
+    def _after_transaction_end(self, session: Session, transaction) -> None:
+        if transaction.parent is None and (_JOURNAL in session.info or _CLOCKS in session.info):
+            # The outermost transaction ended without a commit (a commit clears both).
+            self._undo(session, writes_only=False)
+            session.info.pop(_JOURNAL, None)
+            session.info.pop(_CLOCKS, None)
+
+    def _undo(self, session: Session, *, writes_only: bool) -> None:
+        """Put memory back as it was before this transaction changed it.
+
+        ``writes_only`` gives back what writes took and keeps this
+        transaction's skips: a SAVEPOINT rolled back, the transaction goes on.
+        """
+        with self._lock:
+            for key, journal in session.info.get(_JOURNAL, {}).items():
+                entry = self._memory.pop(key, {})
+                for column, line in journal.items():
+                    before, now, taken = line
+                    if entry.get(column, _ABSENT) is not now:
+                        continue  # changed since by another session: theirs is newer
+                    if writes_only:
+                        if now is _ABSENT:
+                            entry[column] = line[1] = taken
+                    elif before is _ABSENT:
+                        entry.pop(column, None)
+                    else:
+                        entry[column] = before
+                if entry:
+                    self._memory[key] = entry
+            self._trim()
+            # Clocks recorded in this transaction may come from its own
+            # rolled-back writes: forget them and read the database again.
+            recorded = session.info.get(_CLOCKS, [])
+            for state, _ in recorded:
+                self._clocks.pop(state, None)
+        for state, clock in recorded:
+            obj = state.obj()
+            if obj is not None and state.session is session and state.persistent:
+                session.expire(obj, [clock])
+        recorded.clear()
+
+    def _trim(self) -> None:
+        while len(self._memory) > self.max_remembered:
+            self._memory.popitem(last=False)
+
+    def _db_clock(self, state, clock: str):
         """The clock value as the database holds it right now."""
+        with self._lock:
+            recorded = self._clocks.get(state, _ABSENT)
+        if recorded is not _ABSENT:
+            return recorded
         history = state.attrs[clock].history
         if history.deleted:
             return history.deleted[0]
