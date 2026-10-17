@@ -45,22 +45,25 @@ For a watched model, at flush time:
 
 "Stored `clock` age" means the value the database holds, not the one on the object. A skip never moves it, so a row stamped every minute is still written once per `min_interval`.
 
+Remembered values are written with a guard: each one is set only where the stored `clock` is still older than the skip (`CASE WHEN clock < :skipped THEN :value ELSE column END`). If another process has written the row since, its newer values stay.
+
 Unwatched models are untouched. Naive datetimes are read as UTC, so SQLite and Postgres behave the same.
 
 ## Transactions
 
-Remembered values follow the transaction:
+Remembered values follow the transaction, and each SAVEPOINT on its own:
 
-- A write takes them with it. If that transaction rolls back, or the session closes without a commit, they come back.
-- Values skipped inside a transaction that rolls back are forgotten.
-- A rolled-back SAVEPOINT gives back what its writes took and keeps the skips of the transaction around it.
+- A write takes them with it. If its transaction or SAVEPOINT rolls back, or the session closes without a commit, they come back.
+- Values skipped inside a transaction or SAVEPOINT that rolls back are forgotten.
+- Rolling back a SAVEPOINT undoes only what happened inside it.
 
 When `max_remembered` is reached, the oldest row's skipped values are dropped and never written. The interval still holds: the stored clock is kept per object, apart from the skipped values.
 
 ## When not to use it
 
 - **When another process reads the bookkeeping value for correctness.** The database keeps the older value for up to `min_interval`.
-- **When several processes need the newest skipped value.** Remembered values live in the process memory of the process that skipped them.
+- **When several processes need the newest skipped value.** Remembered values live in the memory of the process that skipped them. Writes from several processes are safe (see the guard above), but each one only knows its own skips.
+- **With a `before_update` hook that stamps a column on every call.** SQLAlchemy calls `before_update` for every dirty object, even one with no net changes, so such a hook turns a skip back into an UPDATE, and `stats` still counts it as skipped. Check `object_session(target).is_modified(target)` inside the hook, as SQLAlchemy's documentation advises, or use the column's `onupdate=`, which only fires when an UPDATE is sent.
 - **On columns with triggers that must fire on every change.**
 - **For writes made with Core `update()` statements.** Only ORM flushes are seen.
 
@@ -73,11 +76,11 @@ pytest
 
 The tests count the UPDATE statements the database actually receives and read rows back through a separate session, rather than trusting the library's own statistics. They run on SQLite locally. Set `QU_TEST_DB_URL` to run them on PostgreSQL; CI runs both.
 
-See [CHANGELOG.md](CHANGELOG.md) for the bugs fixed in 0.2.0 and 0.2.1. Each fix comes with a test that fails on the release before it.
+See [CHANGELOG.md](CHANGELOG.md) for the bugs fixed in each release. Each fix comes with a test that fails on the release before it. Releases are tagged, so you can run the tests against an older one (`git show v0.2.1:src/quiet_updates/__init__.py`).
 
 ## How it was written
 
-I wrote it with Claude Code as a pair programmer, and every commit carries its co-author line. 0.1.0, 0.2.0 and 0.2.1 came out on the same day. Each release after the first fixes bugs found by reviewing the one before.
+I wrote it with Claude Code as a pair programmer, and every commit carries its co-author line. All releases so far came out on the same day. The bugs they fix were found by AI code review (a Claude agent asked to break the library) and each was reproduced as a failing test before it was fixed. No one else uses it yet.
 
 ## License
 

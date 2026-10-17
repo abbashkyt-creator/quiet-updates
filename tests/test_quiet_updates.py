@@ -340,6 +340,104 @@ def test_a_rolled_back_savepoint_gives_back_what_its_write_took(env):
     assert (row.price, row.countdown) == (10, 540)
 
 
+def test_a_write_without_the_clock_keeps_the_stored_clock(env):
+    # Regression for 0.2.1: every write forgot the stored clock, even one that
+    # did not store the clock. After an eviction the object kept its skipped
+    # clock, so that row looked fresh forever.
+    engine, factory, quiet, clock, updates = env
+    quiet.max_remembered = 2
+    with factory() as s:
+        for pk in (2, 3):
+            s.add(Item(id=pk, title="x", price=1, checked_at=T0, countdown=600))
+        s.commit()
+    with Session(engine, expire_on_commit=False) as s:
+        quiet.install(s)
+        try:
+            items = [s.get(Item, pk) for pk in (1, 2, 3)]
+            for minute in range(1, 11):
+                clock.at = T0 + timedelta(minutes=minute)
+                for item in items:  # the third skip evicts the first row
+                    item.checked_at = clock.at
+                    s.commit()
+                for item in items:  # price only: these UPDATEs do not store the clock
+                    item.price += 1
+                    s.commit()
+        finally:
+            quiet.uninstall(s)
+    for pk in (1, 2, 3):
+        assert utc(stored(engine, Item, pk).checked_at) >= T0 + timedelta(minutes=5)
+
+
+def test_a_remembered_value_never_overwrites_a_newer_write_from_another_process(env):
+    # Regression for 0.2.1: worker A carried its old skipped values into its
+    # next UPDATE and overwrote what worker B had written since.
+    engine, factory_a, quiet_a, clock, updates = env
+    quiet_b = QuietUpdates(now=clock).watch(
+        Item, columns={"checked_at", "countdown"}, clock="checked_at",
+        min_interval=timedelta(minutes=5),
+    )
+    factory_b = sessionmaker(engine)
+    quiet_b.install(factory_b)
+    try:
+        clock.at = T0 + timedelta(minutes=1)
+        with factory_a() as s:
+            item = s.get(Item, 1)
+            item.checked_at, item.countdown = clock.at, 540  # A skips
+            s.commit()
+        clock.at = T0 + timedelta(minutes=6)
+        with factory_b() as s:
+            item = s.get(Item, 1)
+            item.checked_at, item.countdown = clock.at, 240  # stale for B: written
+            s.commit()
+        clock.at = T0 + timedelta(minutes=7)
+        with factory_a() as s:
+            s.get(Item, 1).price = 11  # A's next UPDATE
+            s.commit()
+    finally:
+        quiet_b.uninstall(factory_b)
+    row = stored(engine, Item, 1)
+    assert (row.price, row.countdown) == (11, 240)
+    assert utc(row.checked_at) == T0 + timedelta(minutes=6)
+
+
+def test_a_rolled_back_empty_savepoint_gives_nothing_back(env):
+    # Regression for 0.2.1: a SAVEPOINT rollback undid the whole session's
+    # journal, so values an earlier write had stored were sent again.
+    engine, factory, quiet, clock, updates = env
+    clock.at = T0 + timedelta(minutes=1)
+    with factory() as s:
+        s.get(Item, 1).countdown = 540  # skipped
+        s.commit()
+    with factory() as s:
+        s.get(Item, 1).price = 11  # carries countdown=540
+        s.flush()
+        s.begin_nested().rollback()  # an empty SAVEPOINT
+        s.commit()
+    with factory() as s:
+        s.get(Item, 1).title = "lamp 2"
+        s.commit()
+    assert "countdown" not in updates[-1]
+
+
+def test_a_skip_inside_a_rolled_back_savepoint_is_forgotten(env):
+    # Regression for 0.2.1: the skip survived its rolled-back SAVEPOINT and
+    # was written with the row's next UPDATE.
+    engine, factory, quiet, clock, updates = env
+    clock.at = T0 + timedelta(minutes=1)
+    with factory() as s:
+        item = s.get(Item, 1)
+        savepoint = s.begin_nested()
+        item.countdown = 540
+        s.flush()
+        savepoint.rollback()
+        assert quiet.value(item, "countdown") == 600
+        s.commit()
+    with factory() as s:
+        s.get(Item, 1).price = 11
+        s.commit()
+    assert stored(engine, Item, 1).countdown == 600
+
+
 def test_the_stored_clock_is_read_once_per_object(env):
     # Regression for 0.2.0: the stored clock of an expired object was read
     # from the database on every flush, even when it was already known.

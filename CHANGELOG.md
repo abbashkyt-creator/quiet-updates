@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.2.2 (2026-10-17)
+
+Bugs found in review of 0.2.1. Each one has a test that fails on 0.2.1 and passes now.
+
+- **Fixed (data loss): a remembered value could overwrite a newer write from another process.**
+  - Worker A skipped at T+1 with countdown 540. Worker B then wrote T+6 with countdown 240. A's next UPDATE, a price
+    change, carried T+1/540 with it: the stored clock went backwards and B's value was lost.
+  - Remembered values are now written as `CASE WHEN clock < :skipped THEN :value ELSE column END`, so they only land
+    where the stored clock is still older than the skip.
+  - Test: `test_a_remembered_value_never_overwrites_a_newer_write_from_another_process`.
+- **Fixed: a write that did not store the clock still forgot the stored clock.**
+  - After an eviction, the object kept the skipped clock that a skip had put on it, so the row looked fresh for good.
+  - Now only an UPDATE that stores the clock resets it.
+  - Test: `test_a_write_without_the_clock_keeps_the_stored_clock`.
+- **Fixed: a SAVEPOINT rollback undid the whole session's journal.**
+  - Rolling back an empty SAVEPOINT gave back values that an earlier write had already stored, and the next UPDATE
+    sent them again.
+  - A skip made inside a rolled-back SAVEPOINT survived it.
+  - The journal is now kept per SAVEPOINT; a rollback undoes only its own scope and the SAVEPOINTs inside it.
+  - Tests: `test_a_rolled_back_empty_savepoint_gives_nothing_back`,
+    `test_a_skip_inside_a_rolled_back_savepoint_is_forgotten`.
+- **Docs:** a `before_update` hook that stamps a column on every call turns a skip back into an UPDATE, and `stats`
+  still counts it as skipped. The README says how to avoid it.
+
 ## 0.2.1 (2026-10-17)
 
 Bugs found in review of 0.2.0. Each one has a test that fails on 0.2.0 and passes now.
