@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.0 (2026-10-17)
+
+Remembering skipped values is removed. Every review so far found a bug that lost or overwrote data, and since 0.2.0
+every one of them was in that feature. It is a cache that has to stay coherent across sessions, SAVEPOINTs, threads,
+processes and databases.
+
+- **Changed (breaking): a skipped change is discarded.** No UPDATE is sent, and the object goes back to the values the
+  database holds. Nothing is carried into a later UPDATE. The library keeps no state between flushes.
+- **Removed:** `QuietUpdates.value()` and `max_remembered`.
+- **Fixed by the removal.** The round-5 review reproduced these in 0.3.0:
+  - `Session.merge(load=False)` raised AttributeError for any watched model. Test:
+    `test_merge_without_load_works_with_and_without_the_library` (fails on 0.3.0).
+  - With `load_only`, the clock was never read and the interval stretched forever. Test:
+    `test_a_clock_that_was_not_loaded_still_keeps_the_interval` (fails on 0.3.0).
+  - The guard against another process's newer write could be lost, through a cut or a thread race. A clock-only write
+    by anyone else made every remembered value be dropped.
+  - Memory was keyed by model and primary key, so two databases shared it.
+  - `uninstall()` left the model listeners behind.
+- **Changed: the oracle test compares against an executable model.** Plain SQLAlchemy applies the rule by hand. After
+  every step the ORM objects and the rows each transaction sees must match exactly, so too much, too little or a
+  stretched skip fails at once. The programs keep their objects alive, as applications do.
+- **Added:** `tools/check_oracle_catches_bugs.py`. It plants four bugs and checks that the oracle catches each one.
+
 ## 0.3.0 (2026-10-17)
 
 A new design. Each review of 0.2.0, 0.2.1 and 0.2.2 found data loss in its rollback handling, so this release
