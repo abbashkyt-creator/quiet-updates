@@ -8,13 +8,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import pytest
-from sqlalchemy import DateTime, Integer, String, create_engine, event
+from sqlalchemy import DateTime, Integer, String, create_engine, event, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from quiet_updates import QuietUpdates
 
 T0 = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
-DB_URL = os.environ.get("QU_TEST_DB_URL", "sqlite://")
+DB_URL = os.environ.get("QU_TEST_DB_URL")
 
 
 class Base(DeclarativeBase):
@@ -44,9 +44,26 @@ class Clock:
         return self.at
 
 
+def real_sqlite_transactions(engine) -> None:
+    """SQLAlchemy's documented pysqlite workaround: without it SAVEPOINTs, and
+    so the rollback tests, do not behave as they do on a real server. WAL lets
+    one session read while another commits."""
+
+    @event.listens_for(engine, "connect")
+    def _connect(dbapi_connection, record):
+        dbapi_connection.isolation_level = None
+        dbapi_connection.execute("PRAGMA journal_mode=WAL")
+
+    @event.listens_for(engine, "begin")
+    def _begin(conn):
+        conn.exec_driver_sql("BEGIN")
+
+
 @pytest.fixture()
-def env():
-    engine = create_engine(DB_URL)
+def env(tmp_path):
+    engine = create_engine(DB_URL or f"sqlite:///{tmp_path / 'qu.db'}")
+    if engine.dialect.name == "sqlite":
+        real_sqlite_transactions(engine)
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     updates: list[str] = []
@@ -436,6 +453,140 @@ def test_a_skip_inside_a_rolled_back_savepoint_is_forgotten(env):
         s.get(Item, 1).price = 11
         s.commit()
     assert stored(engine, Item, 1).countdown == 600
+
+
+def test_releasing_a_savepoint_keeps_what_a_rollback_must_give_back(env):
+    # Regression for 0.2.2 (B1): SQLAlchemy fires after_commit when a SAVEPOINT
+    # is released, and that wiped the journal, so a later rollback lost the
+    # skipped value a write had taken.
+    engine, factory, quiet, clock, updates = env
+    clock.at = T0 + timedelta(minutes=1)
+    with factory() as s:
+        s.get(Item, 1).countdown = 540  # skipped
+        s.commit()
+    with factory() as s:
+        s.get(Item, 1).price = 11  # this UPDATE takes countdown=540
+        s.flush()
+        with s.begin_nested():  # released on success
+            pass
+        s.rollback()
+    with factory() as s:
+        s.get(Item, 1).title = "lamp 2"
+        s.commit()
+    assert stored(engine, Item, 1).countdown == 540
+
+
+def test_a_skip_in_a_released_savepoint_rolls_back_with_its_parent(env):
+    # Regression for 0.2.2 (B2).
+    engine, factory, quiet, clock, updates = env
+    clock.at = T0 + timedelta(minutes=1)
+    with factory() as s:
+        item = s.get(Item, 1)
+        with s.begin_nested():
+            item.countdown = 540
+            s.flush()  # skipped inside the SAVEPOINT, which is then released
+        s.rollback()
+        assert quiet.value(s.get(Item, 1), "countdown") == 600
+    with factory() as s:
+        s.get(Item, 1).price = 11
+        s.commit()
+    assert stored(engine, Item, 1).countdown == 600
+
+
+def test_a_skip_that_did_not_move_the_clock_never_overwrites_a_newer_write(env):
+    # Regression for 0.2.2 (B3): the guard was only built when the skip moved
+    # the clock, so a countdown-only skip overwrote another process's write.
+    engine, factory_a, quiet_a, clock, updates = env
+    quiet_b = QuietUpdates(now=clock).watch(
+        Item, columns={"checked_at", "countdown"}, clock="checked_at",
+        min_interval=timedelta(minutes=5),
+    )
+    factory_b = sessionmaker(engine)
+    quiet_b.install(factory_b)
+    try:
+        clock.at = T0 + timedelta(minutes=1)
+        with factory_a() as s:
+            s.get(Item, 1).countdown = 540  # A skips; the clock is untouched
+            s.commit()
+        clock.at = T0 + timedelta(minutes=6)
+        with factory_b() as s:
+            item = s.get(Item, 1)
+            item.checked_at, item.countdown = clock.at, 240  # B writes
+            s.commit()
+        with factory_a() as s:
+            s.get(Item, 1).price = 11
+            s.commit()
+    finally:
+        quiet_b.uninstall(factory_b)
+    assert (stored(engine, Item, 1).price, stored(engine, Item, 1).countdown) == (11, 240)
+
+
+def test_another_sessions_uncommitted_skip_is_not_written(env):
+    # Regression for 0.2.2 (B4): a skip was shared with every session before
+    # it committed, so another session's write stored a value whose own
+    # transaction then rolled back.
+    engine, factory, quiet, clock, updates = env
+    clock.at = T0 + timedelta(minutes=1)
+    with factory() as s1, factory() as s2:
+        s1.get(Item, 1).countdown = 540
+        s1.flush()  # skipped, not committed
+        item = s2.get(Item, 1)
+        assert quiet.value(item, "countdown") == 600
+        item.price = 11
+        s2.commit()
+        s1.rollback()
+    assert stored(engine, Item, 1).countdown == 600
+
+
+def test_a_sql_expression_is_written_not_remembered(env):
+    # Regression for 0.2.2 (B5): a skipped func.now() was kept as a Python
+    # object, and every later write of the row failed.
+    engine, factory, quiet, clock, updates = env
+    clock.at = T0 + timedelta(minutes=1)
+    with factory() as s:
+        s.get(Item, 1).countdown = func.abs(-540)
+        s.commit()
+    assert len(updates) == 1
+    with factory() as s:
+        s.get(Item, 1).price = 11
+        s.commit()
+    assert (stored(engine, Item, 1).price, stored(engine, Item, 1).countdown) == (11, 540)
+
+
+def test_setting_a_column_back_to_its_stored_value_after_a_reload_counts(env):
+    # Found by the oracle test in 0.3.0 development: a reloaded object showed
+    # the stored 600, so setting 600 was no change to SQLAlchemy, and the
+    # remembered 540 was written later instead.
+    engine, factory, quiet, clock, updates = env
+    clock.at = T0 + timedelta(minutes=1)
+    with factory() as s:
+        s.get(Item, 1).countdown = 540  # skipped
+        s.commit()
+    with factory() as s:
+        item = s.get(Item, 1)
+        assert item.countdown == 540  # a loaded object shows the remembered value
+        item.countdown = 600
+        s.commit()
+    with factory() as s:
+        s.get(Item, 1).price = 11
+        s.commit()
+    assert stored(engine, Item, 1).countdown == 600
+
+
+def test_skipped_increments_in_one_process_add_up(env):
+    # Round-4 review (B6): three skipped `+= 1` were stored as one. A loaded
+    # object now shows the remembered value, so each session adds to it.
+    engine, factory, quiet, clock, updates = env
+    clock.at = T0 + timedelta(minutes=1)
+    for _ in range(3):
+        with factory() as s:
+            s.get(Item, 1).countdown += 1  # skipped each time
+            s.commit()
+    with factory() as s:
+        s.get(Item, 1).price = 11
+        s.commit()
+    assert quiet.stats.skipped == 3
+    assert stored(engine, Item, 1).countdown == 603
 
 
 def test_the_stored_clock_is_read_once_per_object(env):

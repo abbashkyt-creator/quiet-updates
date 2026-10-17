@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.3.0 (2026-10-17)
+
+A new design. Each review of 0.2.0, 0.2.1 and 0.2.2 found data loss in its rollback handling, so this release
+replaces the patched undo journal instead of patching it again.
+
+- **Changed: skips are a redo log.**
+  - A skip stays with its session, in the SAVEPOINT that made it, until the outermost transaction commits. Only then
+    do other sessions see it.
+  - A released SAVEPOINT hands what it did to the scope around it. A rollback drops its scope.
+  - A write records a cut: it consumes every remembered value of its row below its scope, and names the committed
+    ones, so newer values committed meanwhile by other sessions survive.
+- **Added: loaded and refreshed objects show their remembered values,** so the ORM and `quiet.value()` agree. A
+  session the library is not installed on still sees the database.
+- **Added: an oracle test** (`tests/test_against_plain_sqlalchemy.py`). It runs 300 random programs on plain
+  SQLAlchemy and with the library. After every step both sides must see the same values, and at the end both
+  databases must be identical.
+- **Tests:** SQLite now runs with real SAVEPOINTs (SQLAlchemy's pysqlite workaround) and in WAL mode, so the
+  rollback tests mean what they say.
+
+Fixed. Each fix has a test that fails on 0.2.2:
+
+- **B1 (data loss): releasing a SAVEPOINT wiped the rollback journal.** SQLAlchemy fires `after_commit` on a release.
+  Test: `test_releasing_a_savepoint_keeps_what_a_rollback_must_give_back`.
+- **B2: a skip in a released SAVEPOINT survived its parent's rollback.** Test:
+  `test_a_skip_in_a_released_savepoint_rolls_back_with_its_parent`.
+- **B3 (data loss): a skip that did not move the clock had no guard,** and overwrote another process's newer write.
+  It now lands only where the stored clock is unchanged since the skip. Test:
+  `test_a_skip_that_did_not_move_the_clock_never_overwrites_a_newer_write`.
+- **B4: another session's uncommitted skip could be written.** Test:
+  `test_another_sessions_uncommitted_skip_is_not_written`.
+- **B5: a skipped SQL expression poisoned the row.** Every later write failed. A SQL expression is now always
+  written. Test: `test_a_sql_expression_is_written_not_remembered`.
+- **B6: skipped increments in sequential sessions were stored as one.** Test:
+  `test_skipped_increments_in_one_process_add_up`.
+
+Found by the oracle test while building this release, never in a release:
+
+- A re-stamp with the same time as the stored clock was refused by the guard, which is now `<=`.
+- A session's own skip shadowed a committed one, and a write consumed only the visible value, so the committed one
+  came back. This is what the cut fixes.
+- A reloaded object showed the stored value, so setting a column back to it was no change to SQLAlchemy, and the
+  remembered value was written instead. Test: `test_setting_a_column_back_to_its_stored_value_after_a_reload_counts`
+  (it fails on 0.2.2).
+
 ## 0.2.2 (2026-10-17)
 
 Bugs found in review of 0.2.1. Each one has a test that fails on 0.2.1 and passes now.
