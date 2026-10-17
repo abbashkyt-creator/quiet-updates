@@ -26,12 +26,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable
 
 from sqlalchemy import event, inspect, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, SynonymProperty
 from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.sql.expression import ClauseElement
 
 __all__ = ["QuietUpdates", "QuietStats"]
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 
 def _utc_now() -> datetime:
@@ -109,20 +109,33 @@ class QuietUpdates:
         return None
 
     def _before_flush(self, session: Session, flush_context, instances) -> None:
-        for obj in list(session.dirty):
+        dirty = session.dirty
+        # session.flush(objects=[...]) flushes only those: leave the rest pending.
+        candidates = list(dirty) if instances is None else [obj for obj in instances if obj in dirty]
+        quiet = []
+        for obj in candidates:
             rule = self._rule_for(obj)
             if rule is None or not session.is_modified(obj, include_collections=False):
                 continue
             state = inspect(obj)
-            changed = {a.key: a.history for a in state.attrs if a.history.has_changes()}
+            synonyms = {prop.key for prop in state.mapper.attrs if isinstance(prop, SynonymProperty)}
+            changed = {
+                a.key: a.history for a in state.attrs
+                if a.key not in synonyms and a.history.has_changes()  # a synonym shows its column's change
+            }
             if not changed:
                 continue
-            quiet_kind = set(changed) <= rule.columns and not any(
+            if set(changed) <= rule.columns and not any(
                 isinstance(value, ClauseElement)  # a SQL expression is always written
                 for history in changed.values()
                 for value in history.added
-            )
-            if quiet_kind and self._fresh(self._stored_clock(session, state, rule.clock), rule):
+            ):
+                quiet.append((obj, state, rule, changed))
+            else:
+                self.stats.written += 1
+        stored = self._stored_clocks(session, [(state, rule.clock) for _, state, rule, _ in quiet])
+        for obj, state, rule, changed in quiet:
+            if self._fresh(stored[id(state)], rule):
                 self._discard(session, obj, changed)
                 self.stats.skipped += 1
             else:
@@ -141,23 +154,42 @@ class QuietUpdates:
             session.expire(obj, reload)
 
     @staticmethod
-    def _stored_clock(session: Session, state, clock: str):
-        """The clock value as the database holds it, in this transaction."""
-        history = state.attrs[clock].history
-        if history.deleted:
-            return history.deleted[0]
-        if history.unchanged:
-            return history.unchanged[0]
-        # Expired or never loaded (and possibly set since): SQLAlchemy has no
-        # stored value, so ask the database.
-        mapper = state.mapper
-        query = select(getattr(mapper.class_, clock)).where(
-            *[col == value for col, value in zip(mapper.primary_key, state.identity)]
-        )
+    def _stored_clocks(session: Session, wanted: list) -> dict:
+        """id(state) -> the clock as SQLAlchemy last loaded or flushed it.
+
+        Expired or never-loaded clocks (possibly set since) have no stored value
+        in SQLAlchemy, so they are read from the database: one query per model
+        with a single-column primary key, one per row otherwise.
+        """
+        found, missing = {}, {}
+        for state, clock in wanted:
+            history = state.attrs[clock].history
+            if history.deleted:
+                found[id(state)] = history.deleted[0]
+            elif history.unchanged:
+                found[id(state)] = history.unchanged[0]
+            else:
+                missing.setdefault((state.mapper, clock), []).append(state)
         with session.no_autoflush:
-            return session.execute(query).scalar_one_or_none()
+            for (mapper, clock), states in missing.items():
+                column = getattr(mapper.class_, clock)
+                keys = mapper.primary_key
+                if len(keys) == 1:
+                    rows = session.execute(
+                        select(keys[0], column).where(keys[0].in_([s.identity[0] for s in states]))
+                    ).all()
+                    by_key = {key: value for key, value in rows}
+                    for s in states:
+                        found[id(s)] = by_key.get(s.identity[0])
+                else:
+                    for s in states:
+                        query = select(column).where(*[k == v for k, v in zip(keys, s.identity)])
+                        found[id(s)] = session.execute(query).scalar_one_or_none()
+        return found
 
     def _fresh(self, stored: datetime | None, rule: _Rule) -> bool:
         if stored is None:
             return False  # never stamped: write it
-        return _aware(self.now()) - _aware(stored) < rule.min_interval
+        # abs(): a stored clock ahead of now() (a clock in another timezone,
+        # read as UTC) is trusted for one interval only, not until it is reached.
+        return abs(_aware(self.now()) - _aware(stored)) < rule.min_interval

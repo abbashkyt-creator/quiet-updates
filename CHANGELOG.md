@@ -1,9 +1,31 @@
 # Changelog
 
+## 0.4.1 (2026-10-17)
+
+Bugs found in review of 0.4.0. Each one has a test that fails on 0.4.0 and passes now.
+
+- **Fixed: a `synonym()` turned the library off.** The synonym's own key looked like a changed column that is not
+  bookkeeping, so every change was written. Test: `test_a_synonym_does_not_turn_the_library_off`.
+- **Fixed: a stored clock ahead of `now()` stopped all writes** until `now()` caught up. Local time read as UTC
+  was 3 hours ahead. It is now trusted for one interval only. Test:
+  `test_a_stored_clock_ahead_of_now_is_trusted_for_one_interval_only`.
+- **Fixed: `session.flush(objects=[...])` discarded changes on objects outside the flush.** Test:
+  `test_flushing_other_objects_leaves_this_ones_changes_pending`.
+- **Changed: expired clocks are read in one query per model,** not one per row. Test:
+  `test_expired_clocks_are_read_in_one_query_per_model`.
+- **Oracle test:**
+  - it now also changes data and bookkeeping in one flush, which must be written whole;
+  - the review showed a planted bug that dropped such a data change passed it, and that bug is now the tool's fifth
+    mutant;
+  - `tools/check_oracle_catches_bugs.py` first checks that the oracle passes on the unmodified library, and CI runs
+    it.
+- **Docs:** "stored clock" means SQLAlchemy's last loaded or flushed value; each flush, autoflush included, is
+  judged on its own; a clock set by a SQL expression saves nothing; 0.4.0 deliberately reverses 0.2.0's first fix.
+
 ## 0.4.0 (2026-10-17)
 
-Remembering skipped values is removed. Every review so far found a bug that lost or overwrote data, and since 0.2.0
-every one of them was in that feature. It is a cache that has to stay coherent across sessions, SAVEPOINTs, threads,
+Remembering skipped values is removed. Every review so far found a bug that lost or overwrote data. Since 0.2.0
+every one of them was in that feature, and four reviews of it in a row found new ones. It is a cache that has to stay coherent across sessions, SAVEPOINTs, threads,
 processes and databases.
 
 - **Changed (breaking): a skipped change is discarded.** No UPDATE is sent, and the object goes back to the values the

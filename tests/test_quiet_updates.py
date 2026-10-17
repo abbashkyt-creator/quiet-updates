@@ -9,7 +9,7 @@ from typing import Optional
 
 import pytest
 from sqlalchemy import DateTime, Integer, String, create_engine, event, func, select
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, load_only, mapped_column, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, load_only, mapped_column, sessionmaker, synonym
 
 from quiet_updates import QuietUpdates
 
@@ -34,6 +34,14 @@ class Other(Base):
     __tablename__ = "qu_others"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class Polled(Base):
+    __tablename__ = "qu_polled"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ticks: Mapped[int] = mapped_column(Integer)
+    tick_count = synonym("ticks")
 
 
 class Clock:
@@ -279,6 +287,81 @@ def test_another_session_sees_the_database(env):
         s2.commit()
         s1.rollback()
     assert (stored(engine, Item, 1).price, stored(engine, Item, 1).countdown) == (11, 600)
+
+
+def test_a_synonym_does_not_turn_the_library_off(env):
+    # Regression for 0.4.0 (round-6 review): the synonym's own key showed up as
+    # a changed attribute that is not bookkeeping, so every change was written.
+    engine, factory, quiet, clock, updates = env
+    quiet.watch(Polled, columns={"checked_at", "ticks"}, clock="checked_at", min_interval=timedelta(minutes=5))
+    with factory() as s:
+        s.add(Polled(id=1, checked_at=T0, ticks=0))
+        s.commit()
+    clock.at = T0 + timedelta(minutes=1)
+    with factory() as s:
+        s.get(Polled, 1).tick_count = 5
+        s.commit()
+    assert updates == []
+
+
+def test_a_stored_clock_ahead_of_now_is_trusted_for_one_interval_only(env):
+    # Regression for 0.4.0 (round-6 review): a clock 3 hours ahead (local time
+    # read as UTC) looked fresh until now() caught up, so nothing was written.
+    engine, factory, quiet, clock, updates = env
+    with factory() as s:
+        s.add(Item(id=2, title="fan", price=5, checked_at=T0 + timedelta(hours=3), countdown=100))
+        s.commit()
+    clock.at = T0 + timedelta(minutes=1)
+    with factory() as s:
+        item = s.get(Item, 2)
+        item.checked_at, item.countdown = clock.at, 90
+        s.commit()
+    assert len(updates) == 1
+    assert utc(stored(engine, Item, 2).checked_at) == clock.at
+
+
+def test_flushing_other_objects_leaves_this_ones_changes_pending(env):
+    # Regression for 0.4.0 (round-6 review): session.flush([other]) discarded
+    # changes on objects outside the flush.
+    engine, factory, quiet, clock, updates = env
+    clock.at = T0 + timedelta(minutes=1)
+    with factory() as s:
+        item, other = s.get(Item, 1), s.get(Other, 1)
+        item.countdown = 540
+        other.checked_at = clock.at
+        s.flush([other])
+        item.price = 11  # now a data change: the countdown goes with it
+        s.commit()
+    row = stored(engine, Item, 1)
+    assert (row.price, row.countdown) == (11, 540)
+
+
+def test_expired_clocks_are_read_in_one_query_per_model(env):
+    engine, factory, quiet, clock, updates = env
+    with factory() as s:
+        for pk in (2, 3, 4):
+            s.add(Item(id=pk, title="x", price=1, checked_at=T0, countdown=60))
+        s.commit()
+    clock_reads: list[str] = []
+
+    def _count(conn, cursor, statement, params, context, executemany):
+        sql = statement.lstrip().upper()
+        if sql.startswith("SELECT") and "TITLE" not in sql:
+            clock_reads.append(statement)
+
+    clock.at = T0 + timedelta(minutes=1)
+    with factory() as s:
+        items = [s.get(Item, pk) for pk in (1, 2, 3, 4)]
+        s.commit()  # expires them
+        event.listen(engine, "before_cursor_execute", _count)
+        try:
+            for item in items:
+                item.checked_at = clock.at  # set while expired
+            s.commit()
+        finally:
+            event.remove(engine, "before_cursor_execute", _count)
+    assert updates == []
+    assert len(clock_reads) == 1
 
 
 def test_the_clock_must_be_a_bookkeeping_column():

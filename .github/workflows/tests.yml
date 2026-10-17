@@ -13,6 +13,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[test]"
       - run: pytest -q
+      - run: python tools/check_oracle_catches_bugs.py
 
   postgres:
     runs-on: ubuntu-latest

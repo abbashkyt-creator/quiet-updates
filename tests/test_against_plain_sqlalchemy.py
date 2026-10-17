@@ -6,8 +6,8 @@ objects, and the rows each session's transaction sees in the database.
 
 So a library that skips too much, skips too little, stretches the interval,
 or leaves the object different from the database fails at the first step
-where it does. A program mixes bookkeeping-only changes, data changes, clock
-ticks, SAVEPOINTs that are released or rolled back, commits, rollbacks and
+where it does. A program mixes bookkeeping-only changes, data changes, data and bookkeeping
+changed together, clock ticks, SAVEPOINTs that are released or rolled back, commits, rollbacks and
 sessions closed without a commit. It runs on SQLite with real SAVEPOINTs; it
 does not cover concurrent sessions or processes. The seed is in the failure.
 """
@@ -27,7 +27,7 @@ T0 = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 INTERVAL = timedelta(minutes=5)
 PROGRAMS = int(os.environ.get("QU_ORACLE_PROGRAMS", 300))  # set it higher for a deeper run
 STEPS = int(os.environ.get("QU_ORACLE_STEPS", 40))
-OPS = ["tick", "stamp", "stamp", "count", "count", "price", "begin", "release", "rollback_sp",
+OPS = ["tick", "stamp", "stamp", "count", "count", "price", "mixed", "begin", "release", "rollback_sp",
        "commit", "rollback", "close"]
 
 
@@ -102,18 +102,21 @@ class Program:
         self.log.append(f"{op} {pk} {value}")
         if op == "tick":
             self.now += timedelta(minutes=rng.choice((0, 1, 2, 3, 6)))
-        elif op in ("stamp", "count", "price"):
+        elif op in ("stamp", "count", "price", "mixed"):
             rows = []
             for session in (self.lib, self.ref):
                 row = session.get(Row, pk)
                 rows.append(row)
                 self.held.append(row)
-                if session is self.ref and op != "price" and self.fresh(row):
+                data_changes = op in ("price", "mixed") and row.price != value
+                if session is self.ref and op != "price" and not data_changes and self.fresh(row):
                     continue  # the reference does by hand what the library does
                 if op == "stamp":
                     row.checked_at, row.countdown = self.now, value
                 elif op == "count":
                     row.countdown = value
+                elif op == "mixed":  # data and bookkeeping in one flush: written whole
+                    row.price, row.checked_at, row.countdown = value, self.now, value
                 else:
                     row.price = value
                 session.flush()

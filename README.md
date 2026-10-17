@@ -41,7 +41,9 @@ For a watched model, at flush time:
 | Only bookkeeping columns | at or above `min_interval`, or never set | Written |
 | Any other column | any | Written, with the bookkeeping values set in the same flush |
 
-"Stored `clock` age" means the value the database holds in the current transaction, not the one on the object. A discarded change never moves it, so a row stamped every minute is still written once per `min_interval`. If the clock is not loaded (expired, or left out by `load_only`), it is read from the database.
+"Stored `clock`" means the value SQLAlchemy last loaded or flushed for the row, not one set on the object since. Normally that is what the database holds in the current transaction. With `expire_on_commit=False` or `merge(load=False)`, it can be a snapshot from an earlier transaction. A discarded change never moves it, so a row stamped every minute is still written once per `min_interval`. If the clock is not loaded (expired, or left out by `load_only`), it is read from the database, in one query per model. A stored clock ahead of `now()`, such as local time read as UTC, is trusted for one interval only.
+
+Each flush is judged on its own. Autoflush runs a flush before any query or lazy load, so bookkeeping set before one is discarded there, and a later data change is written without it. Set bookkeeping last, or use `with session.no_autoflush:`.
 
 What you give up: between writes, the database holds bookkeeping values up to `min_interval` old, and a discarded value is gone. If your application needs the newest value, it keeps it itself. In my own system the scheduler already kept "last checked" in memory.
 
@@ -51,6 +53,7 @@ The library keeps no state between flushes, so transactions, SAVEPOINTs, other s
 
 - **When another process reads the bookkeeping value for correctness.** The database holds it up to `min_interval` old.
 - **With a `before_update` hook that stamps a column on every call.** SQLAlchemy calls `before_update` for every dirty object, even one with no net changes, so such a hook turns a discarded change back into an UPDATE, and `stats` still counts it as skipped. Check `object_session(target).is_modified(target)` inside the hook, as SQLAlchemy's documentation advises, or use the column's `onupdate=`, which only fires when an UPDATE is sent.
+- **With a clock set by a SQL expression** such as `func.now()`. A SQL expression is always written, so nothing is saved. Set the clock from Python.
 - **On columns with triggers that must fire on every change.**
 - **For writes made with Core `update()` statements.** Only ORM flushes are seen.
 
@@ -67,16 +70,20 @@ The unit tests count the UPDATE statements the database actually receives and re
 `tests/test_against_plain_sqlalchemy.py` is the oracle test, and it runs on SQLite only.
 
 - It runs 300 random programs twice: once with the library, and once on plain SQLAlchemy that applies the rule above by hand.
-- The programs mix bookkeeping changes, data changes, clock ticks, SAVEPOINTs that are released or rolled back, commits, rollbacks and closed sessions.
+- The programs mix bookkeeping changes, data changes, data and bookkeeping changed together, clock ticks, SAVEPOINTs that are released or rolled back, commits, rollbacks and closed sessions.
 - After every step, the ORM objects and the rows each transaction sees must be identical on both sides.
 - It does not cover concurrent sessions or processes. With no state kept between flushes, there is nothing in the library for them to race on.
+- Every program flushes after every change, so it does not cover autoflush timing. Synonyms, subclasses and the other cases above are unit tests.
 
-`tools/check_oracle_catches_bugs.py` plants four bugs in a copy of the library and checks that the oracle catches each one:
+`tools/check_oracle_catches_bugs.py` first checks that the oracle passes on the unmodified library. It then plants five bugs in a copy and checks that the oracle catches each one:
 
 - a library that never skips;
 - one that ignores the interval;
 - the interval-stretch bug fixed in 0.2.0;
-- an object left with a discarded value.
+- an object left with a discarded value;
+- a data change discarded whole because bookkeeping came with it.
+
+CI runs it on every push.
 
 ## How it was written
 
@@ -84,7 +91,9 @@ I wrote it with Claude Code as a pair programmer, and every commit carries its c
 
 The bugs were found by AI code review (a Claude agent asked to break the library), and each was reproduced as a failing test before it was fixed.
 
-Versions 0.2.0 to 0.3.0 remembered skipped values and wrote them with the row's next UPDATE. Five review rounds found a new way for that to lose or overwrite data each time. Remembering them is a cache that has to stay coherent across sessions, SAVEPOINTs, threads, processes and databases. 0.4.0 removes it, and with it every one of those bugs. See [CHANGELOG.md](CHANGELOG.md). Releases are tagged.
+Versions 0.2.0 to 0.3.0 remembered skipped values and wrote them with the row's next UPDATE. Each of the four reviews of those versions found a new way for that to lose or overwrite data. Remembering them is a cache that has to stay coherent across sessions, SAVEPOINTs, threads, processes and databases. 0.4.0 removes it, and with it every one of those bugs.
+
+This takes the library back to 0.1.0's behaviour, which the first review called data loss: a discarded value is never written. Now it is the documented cost. `test_a_discarded_change_is_not_written_later` asserts the opposite of 0.2.0's `test_skipped_values_are_written_with_the_next_real_change`, on purpose. See [CHANGELOG.md](CHANGELOG.md). Releases are tagged.
 
 ## License
 
