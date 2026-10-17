@@ -7,23 +7,29 @@ traffic, even though the data the row exists for did not change.
 
 QuietUpdates installs a ``before_flush`` hook. For a watched model, an UPDATE
 whose changed columns are all bookkeeping columns is dropped while the row's
-stored timestamp is still younger than ``min_interval``. The skipped values are
-remembered (``quiet.value(obj, column)`` returns the newest one, even after the
-session expired the object), and the next real change, or the first change
-after the interval, writes the row as usual.
+*stored* timestamp is younger than ``min_interval``. The skipped values are
+remembered (``quiet.value(obj, column)`` returns the newest one) and are written
+with the row's next UPDATE: a real data change, or the first bookkeeping change
+after the interval.
+
+Only ORM flushes are seen. Core ``update()`` statements bypass the hook.
 """
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable
 
-from sqlalchemy import event, inspect
+from sqlalchemy import event, inspect, select
 from sqlalchemy.orm import Session
-from sqlalchemy.orm.attributes import set_committed_value
+from sqlalchemy.orm.attributes import flag_modified, set_committed_value
 
 __all__ = ["QuietUpdates", "QuietStats"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
+
+_DB_CLOCK = object()  # memory slot for the clock value the database really holds
 
 
 def _utc_now() -> datetime:
@@ -54,12 +60,19 @@ class QuietStats:
 
 @dataclass
 class QuietUpdates:
-    """Register models, then ``install`` on a Session class or sessionmaker."""
+    """Register models, then ``install`` on a Session class or sessionmaker.
+
+    ``max_remembered`` bounds the memory of skipped values. When it is full,
+    the oldest row is forgotten: its database copy simply stays older until
+    that row's next real write.
+    """
 
     now: Callable[[], datetime] = _utc_now
+    max_remembered: int = 100_000
     stats: QuietStats = field(default_factory=QuietStats)
     _rules: dict[type, _Rule] = field(default_factory=dict)
-    _memory: dict[tuple, dict[str, object]] = field(default_factory=dict)
+    _memory: "OrderedDict[tuple, dict]" = field(default_factory=OrderedDict)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def watch(
         self,
@@ -94,16 +107,17 @@ class QuietUpdates:
 
     def value(self, obj: object, column: str):
         """The newest value of ``column``: a skipped one if any, else the object's."""
-        remembered = self._memory.get(self._key(obj), {})
-        if column in remembered:
-            return remembered[column]
+        with self._lock:
+            remembered = self._memory.get(self._key(obj), {})
+            if column in remembered:
+                return remembered[column]
         return getattr(obj, column)
+
+    # -- internals ---------------------------------------------------------
 
     @staticmethod
     def _key(obj: object) -> tuple:
         return (type(obj), inspect(obj).identity)
-
-    # -- internals ---------------------------------------------------------
 
     def _rule_for(self, obj: object) -> _Rule | None:
         for cls in type(obj).__mro__:
@@ -118,33 +132,55 @@ class QuietUpdates:
             if rule is None or not session.is_modified(obj, include_collections=False):
                 continue
             state = inspect(obj)
-            changed = {
-                attr.key: attr.history
-                for attr in state.attrs
-                if attr.history.has_changes()
-            }
+            changed = {a.key: a.history for a in state.attrs if a.history.has_changes()}
             if not changed:
                 continue
-            if not set(changed) <= rule.columns or not self._still_fresh(state, rule):
+            key = self._key(obj)
+            with self._lock:
+                remembered = self._memory.get(key, {})
+                db_clock = remembered.get(_DB_CLOCK, self._stored(state, rule.clock))
+                quiet = set(changed) <= rule.columns and self._fresh(db_clock, rule)
+                if not quiet:
+                    self._memory.pop(key, None)
+            if not quiet:
+                # Real write: carry every skipped value that was not changed again.
+                for column, value in remembered.items():
+                    if column is not _DB_CLOCK and column not in changed:
+                        setattr(obj, column, value)
+                        flag_modified(obj, column)
                 self.stats.written += 1
-                self._memory.pop(self._key(obj), None)
                 continue
-            remembered = self._memory.setdefault(self._key(obj), {})
-            for key, history in changed.items():
-                new = history.added[0] if history.added else None
-                remembered[key] = new
+            with self._lock:
+                entry = self._memory.pop(key, {})
+                entry.setdefault(_DB_CLOCK, db_clock)
+                for column, history in changed.items():
+                    entry[column] = history.added[0] if history.added else None
+                self._memory[key] = entry  # most recently used goes last
+                while len(self._memory) > self.max_remembered:
+                    self._memory.popitem(last=False)
+            for column, history in changed.items():
                 # Accept the new value on the object without scheduling a write.
-                set_committed_value(obj, key, new)
+                set_committed_value(obj, column, history.added[0] if history.added else None)
             self.stats.skipped += 1
 
-    def _still_fresh(self, state, rule: _Rule) -> bool:
-        history = state.attrs[rule.clock].history
+    @staticmethod
+    def _stored(state, clock: str):
+        """The clock value as the database holds it right now."""
+        history = state.attrs[clock].history
         if history.deleted:
-            stored = history.deleted[0]
-        elif history.unchanged:
-            stored = history.unchanged[0]
-        else:
-            stored = None
+            return history.deleted[0]
+        if history.unchanged:
+            return history.unchanged[0]
+        # The attribute was expired (or never loaded) and possibly set since:
+        # SQLAlchemy does not keep the old value, so ask the database directly.
+        mapper = state.mapper
+        query = select(getattr(mapper.class_, clock)).where(
+            *[col == value for col, value in zip(mapper.primary_key, state.identity)]
+        )
+        with state.session.no_autoflush:
+            return state.session.execute(query).scalar_one_or_none()
+
+    def _fresh(self, stored: datetime | None, rule: _Rule) -> bool:
         if stored is None:
             return False  # never stamped: write it
-        return self.now() - _aware(stored) < rule.min_interval
+        return _aware(self.now()) - _aware(stored) < rule.min_interval

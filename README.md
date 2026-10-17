@@ -30,6 +30,7 @@ with Session() as s:
 
     quiet.value(item, "countdown")        # 540, the newest value, even after expiry
     quiet.stats                           # QuietStats(skipped=1, written=0)
+# The next real change to this row also writes countdown=540 and the new checked_at.
 ```
 
 ## The rules
@@ -39,8 +40,10 @@ For a watched model, at flush time:
 | What changed | Stored `clock` age | Result |
 |---|---|---|
 | Only bookkeeping columns | below `min_interval` | Not written. The new values are remembered. |
-| Only bookkeeping columns | at or above `min_interval`, or never set | Written |
-| Any other column | any | Written, including the bookkeeping columns |
+| Only bookkeeping columns | at or above `min_interval`, or never set | Written, with any remembered values |
+| Any other column | any | Written, with any remembered values |
+
+"Stored `clock` age" means the value the database holds, not the one on the object. A skip never moves it, so a row stamped every minute is still written once per `min_interval`.
 
 Unwatched models are untouched. Naive datetimes are read as UTC, so SQLite and Postgres behave the same.
 
@@ -49,6 +52,7 @@ Unwatched models are untouched. Naive datetimes are read as UTC, so SQLite and P
 - **When another process reads the bookkeeping value for correctness.** The database keeps the older value for up to `min_interval`.
 - **When several processes need the newest skipped value.** Remembered values live in the process memory of the process that skipped them.
 - **On columns with triggers that must fire on every change.**
+- **For writes made with Core `update()` statements.** Only ORM flushes are seen.
 
 ## Tests
 
@@ -57,7 +61,9 @@ pip install -e ".[test]"
 pytest
 ```
 
-The tests use SQLite in memory. They count the actual UPDATE statements sent to the database, rather than trusting the library's own statistics.
+The tests count the UPDATE statements the database actually receives and read rows back through a separate session, rather than trusting the library's own statistics. They run on SQLite locally. Set `QU_TEST_DB_URL` to run them on PostgreSQL; CI runs both.
+
+See [CHANGELOG.md](CHANGELOG.md) for the bugs fixed in 0.2.0. Each fix comes with a test that fails on 0.1.0.
 
 ## License
 
