@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quiet-updates"
+version = "0.1.0"
+description = "Skip SQLAlchemy UPDATEs that only touch bookkeeping columns, such as last-checked timestamps."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Abbas Bidhan" }]
+requires-python = ">=3.10"
+dependencies = ["SQLAlchemy>=2.0"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Framework :: SQLAlchemy",
+  "Topic :: Database",
+  "License :: OSI Approved :: MIT License",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.urls]
+Source = "https://github.com/abbashkyt-creator/quiet-updates"
+"Why it exists" = "https://github.com/abbashkyt-creator/engineering-notes/blob/main/02-write-amplification.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
